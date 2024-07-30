@@ -1,0 +1,76 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import tensorflow as tf
+
+# Load labels
+with open('/home/DMan/tflite_model/coco_labels.txt', 'r') as f:
+    labels = [line.strip() for line in f.readlines()]
+
+# Load TFLite model
+interpreter = tf.lite.Interpreter(model_path='/home/DMan/tflite_model/ssd_mobilenet_v2_coco.tflite')
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+cv2.startWindowThread()
+picam2 = Picamera2()
+picam2.sensor_resolution = (205, 154)  
+picam2.configure(picam2.create_preview_configuration(main={"format": 'XRGB8888', "size": (820, 616)}))
+picam2.start()
+
+while True:
+    frame = picam2.capture_array()
+
+    input_shape = input_details[0]['shape']
+    height, width, channels = input_shape[1], input_shape[2], input_shape[3]
+
+    # Resize frame to match model input dimensions
+    frame_resized = cv2.resize(frame, (width, height))
+
+    # Ensure the frame is in UINT8 format
+    if frame_resized.dtype != np.uint8:
+        frame_resized = frame_resized.astype(np.uint8)
+
+    # Check if frame has alpha channel
+    if frame_resized.shape[2] == 4: 
+        frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGRA2BGR)
+
+    # Prepare input data for the model
+    input_data = np.expand_dims(frame_resized, axis=0).astype(np.uint8)
+
+    # Run inference
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    # Get output
+    boxes = interpreter.get_tensor(output_details[0]['index'])[0]
+    classes = interpreter.get_tensor(output_details[1]['index'])[0]
+    scores = interpreter.get_tensor(output_details[2]['index'])[0]
+
+    # Debugging: Print output data
+    print("Boxes:", boxes)
+    print("Classes:", classes)
+    print("Scores:", scores)
+
+    # Draw results
+    h, w, _ = frame.shape
+    for i in range(len(scores)):
+        if scores[i] > 0.01:  # Adjust threshold if necessary
+            class_id = int(classes[i])
+            if class_id < len(labels) and labels[class_id] == "bear":
+                ymin, xmin, ymax, xmax = boxes[i]
+                (startX, startY, endX, endY) = (int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h))
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                label = f"Bear: {scores[i]:.2f}"
+                cv2.putText(frame, label, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    cv2.imshow("frame", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        break
+
+cv2.destroyAllWindows()
+picam2.stop()
