@@ -1,0 +1,20 @@
+#include <Stepper.h>
+
+const int stepsPerRevolution = 200; // Change this to match your motor
+
+// initialize the stepper library
+Stepper myStepper(stepsPerRevolution, 8, 9, 10, 11); // Change pins according to your setup
+
+void setup() {
+  Serial.begin(9600);
+  myStepper.setSpeed(20); // Set the motor speed (RPM)
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    int steps = Serial.parseInt();
+    if (steps != 0) {
+      myStepper.step(steps);
+    }
+  }
+}
