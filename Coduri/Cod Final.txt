@@ -1,0 +1,173 @@
+import RPi.GPIO as GPIO
+import serial
+import time
+import cv2
+import mediapipe as mp
+import numpy as np
+from picamera2 import Picamera2
+from datetime import datetime
+
+# Setup GPIO
+GPIO.setmode(GPIO.BCM)
+
+# PIR Sensor setup
+PIR_PIN = 4
+GPIO.setup(PIR_PIN, GPIO.IN)
+
+# Ultrasonic Sensor setup
+TRIG_PIN = 23
+ECHO_PIN = 24
+GPIO.setup(TRIG_PIN, GPIO.OUT)
+GPIO.setup(ECHO_PIN, GPIO.IN)
+
+# Laser setup
+LASER_PIN = 17  # Define the GPIO pin for the laser
+GPIO.setup(LASER_PIN, GPIO.OUT)
+
+# Serial connections
+bluetoothSerial1 = serial.Serial("/dev/rfcomm2", baudrate=9600)
+arduino = serial.Serial("/dev/ttyACM0", 19200, timeout=1)
+
+# MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
+mp_drawing = mp.solutions.drawing_utils
+
+# Camera Setup
+cv2.startWindowThread()
+day_camera = Picamera2()
+night_camera = Picamera2()
+
+day_camera.sensor_resolution = (205, 154)
+day_camera.configure(day_camera.create_preview_configuration(main={"format": 'XRGB8888', "size": (820, 616)}))
+
+night_camera.sensor_resolution = (205, 154)
+night_camera.configure(night_camera.create_preview_configuration(main={"format": 'XRGB8888', "size": (820, 616)}))
+
+# Frame dimensions and center point
+frame_width, frame_height = 820, 616
+center_x, center_y = frame_width // 2, frame_height // 2
+
+# Define steps for motor movement
+steps = 20
+
+# Initial vertical motor position in degrees
+vertical_position = 0
+max_vertical_degrees = 10  # Maximum range of motion in degrees
+
+# Target proximity threshold for laser activation (in pixels)
+target_proximity_threshold = 50
+
+def measure_distance():
+    # Measure distance using ultrasonic sensor
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+    start_time = time.time()
+    stop_time = time.time()
+    
+    while GPIO.input(ECHO_PIN) == 0:
+        start_time = time.time()
+    
+    while GPIO.input(ECHO_PIN) == 1:
+        stop_time = time.time()
+    
+    elapsed_time = stop_time - start_time
+    distance = (elapsed_time * 34300) / 2
+    return distance
+
+def move_motor_horizontal(direction):
+    print(f"Moving horizontal: {direction}")
+    if direction == "left":
+        bluetoothSerial1.write(f"{steps}\n".encode())
+    elif direction == "right":
+        bluetoothSerial1.write(f"{-steps}\n".encode())
+
+def move_motor_vertical(direction):
+    global vertical_position
+    print(f"Moving vertical: {direction}")
+    step_angle = 1  # Assuming each step corresponds to 1 degree of movement
+
+    if direction == "up":
+        if vertical_position + step_angle <= max_vertical_degrees:
+            arduino.write(f"{direction}\n".encode())
+            vertical_position += step_angle
+    elif direction == "down":
+        if vertical_position - step_angle >= -max_vertical_degrees:
+            arduino.write(f"{direction}\n".encode())
+            vertical_position -= step_angle
+
+def control_laser(turn_on):
+    """Control the laser module."""
+    GPIO.output(LASER_PIN, turn_on)
+    print("Laser turned", "on" if turn_on else "off")
+
+try:
+    while True:
+        # PIR sensor check
+        if GPIO.input(PIR_PIN):
+            # Check if it's day or night
+            current_hour = datetime.now().hour
+            if 18 <= current_hour or current_hour < 8:
+                camera = night_camera
+            else:
+                camera = day_camera
+
+            camera.start()
+
+            # Capture frame from camera
+            frame = camera.capture_array()
+            
+            # Measure distance
+            distance = measure_distance()
+            print(f"Distance: {distance:.2f} cm")
+
+            # Process the frame with MediaPipe Pose
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(frame_rgb)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            if results.pose_landmarks:
+                mp_drawing.draw_landmarks(frame_bgr, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                nose_landmark = results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE]
+                nose_x = int(nose_landmark.x * frame_width)
+                nose_y = int(nose_landmark.y * frame_height)
+
+                offset_x = nose_x - center_x
+                offset_y = nose_y - center_y
+
+                if abs(offset_x) > 10:
+                    direction = "left" if offset_x < 0 else "right"
+                    move_motor_horizontal(direction)
+
+                if abs(offset_y) > 10:
+                    direction = "up" if offset_y < 0 else "down"
+                    move_motor_vertical(direction)
+
+                cv2.circle(frame_bgr, (nose_x, nose_y), 5, (0, 0, 255), -1)
+                cv2.circle(frame_bgr, (center_x, center_y), 5, (255, 0, 0), -1)
+
+                # Check if the nose is close to the center point
+                if abs(offset_x) <= target_proximity_threshold and abs(offset_y) <= target_proximity_threshold:
+                    control_laser(True)
+                else:
+                    control_laser(False)
+
+            cv2.imshow("frame", frame_bgr)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+        else:
+            camera.stop()
+            control_laser(False)  # Ensure the laser is off when the camera is not active
+            time.sleep(1)
+
+finally:
+    # Cleanup
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+    bluetoothSerial1.close()
+    arduino.close()
+    day_camera.stop()
+    night_camera.stop()
+    control_laser(False)  # Ensure the laser is turned off
